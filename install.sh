@@ -23,6 +23,7 @@ SEED_IMG="${BASE_DIR}/seed.img"
 USER_DATA="${BASE_DIR}/user-data"
 PID_FILE="${BASE_DIR}/.vps.pid"
 RESIZED_FLAG="${BASE_DIR}/.disk_resized"
+DASHBOARD_KEY="${BASE_DIR}/.medu_vps_key"
 
 UBUNTU_IMG_URL="https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
 UBUNTU_SHA_URL="https://cloud-images.ubuntu.com/jammy/current/SHA256SUMS"
@@ -76,6 +77,38 @@ vm_is_running() {
     [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
 }
 
+ensure_dashboard_key() {
+    if [ ! -f "$DASHBOARD_KEY" ]; then
+        ssh-keygen -t ed25519 -f "$DASHBOARD_KEY" -N "" -q -C "medu-vps-dashboard"
+        chmod 600 "$DASHBOARD_KEY"
+    fi
+}
+
+wait_for_ssh() {
+    local port="$1" tries=60
+    while [ "$tries" -gt 0 ]; do
+        (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null && { exec 3>&- 3<&-; return 0; }
+        sleep 1
+        tries=$((tries - 1))
+    done
+    return 1
+}
+
+drop_into_shell() {
+    local port="$1" user="$2"
+    echo -e "${YELLOW}Waiting for guest SSH to come up...${NC}"
+    if ! wait_for_ssh "$port"; then
+        echo -e "${RED}Timed out waiting for SSH on port ${port}.${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}Dropping into ${user}@guest shell...${NC}"
+    ssh -i "$DASHBOARD_KEY" \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR \
+        -p "$port" "${user}@localhost"
+}
+
 # ----------------------------------------------------------
 # menu
 # ----------------------------------------------------------
@@ -98,25 +131,27 @@ show_menu() {
     fi
     echo ""
     echo -e "${YELLOW}Select an option:${NC}"
-    echo -e "  ${CYAN}[1]${NC} Create & boot a new Ubuntu VPS instance"
+    echo -e "  ${CYAN}[1]${NC} Create & boot a new VPS instance"
     echo -e "  ${CYAN}[2]${NC} Restart existing VPS instance"
-    echo -e "  ${CYAN}[3]${NC} Configure TCP port forward rules"
-    echo -e "  ${CYAN}[4]${NC} Clean up VPS files / cache"
-    echo -e "  ${CYAN}[5]${NC} Show current config / status"
-    echo -e "  ${CYAN}[6]${NC} Exit"
+    echo -e "  ${CYAN}[3]${NC} Stop running VPS instance"
+    echo -e "  ${CYAN}[4]${NC} Configure TCP port forward rules"
+    echo -e "  ${CYAN}[5]${NC} Clean up VPS files / cache"
+    echo -e "  ${CYAN}[6]${NC} Show current config / status"
+    echo -e "  ${CYAN}[7]${NC} Exit"
     echo ""
     echo -e "${RED}==========================================================${NC}"
-    echo -ne "${WHITE}Choice [1-6]: ${NC}"
+    echo -ne "${WHITE}Choice [1-7]: ${NC}"
     read -r CHOICE
 
     case "$CHOICE" in
         1) create_vps ;;
         2) restart_vps ;;
-        3) configure_tcp ;;
-        4) clean_vps ;;
-        5) show_status ;;
-        6) echo -e "${GREEN}Goodbye - medu VPS dashboard.${NC}"; exit 0 ;;
-        *) echo -e "${RED}Invalid choice. Pick 1-6.${NC}"; pause_menu 1 ;;
+        3) stop_vps ;;
+        4) configure_tcp ;;
+        5) clean_vps ;;
+        6) show_status ;;
+        7) echo -e "${GREEN}Goodbye - medu VPS dashboard.${NC}"; exit 0 ;;
+        *) echo -e "${RED}Invalid choice. Pick 1-7.${NC}"; pause_menu 1 ;;
     esac
 }
 
@@ -341,22 +376,36 @@ create_vps() {
     fi
 
     loading_bar "Generating cloud-init config"
+    ensure_dashboard_key
+    DASHBOARD_PUBKEY=$(cat "${DASHBOARD_KEY}.pub")
     {
         echo "#cloud-config"
+        echo "disable_root: false"
         echo "ssh_pwauth: True"
         echo "chpasswd:"
         echo "  list: |"
+        echo "    root:${USER_PASS}"
         echo "    ${USER_NAME}:${USER_PASS}"
         echo "  expire: False"
+        echo "users:"
+        echo "  - default"
+        echo "  - name: root"
+        echo "    ssh_authorized_keys:"
+        echo "      - ${DASHBOARD_PUBKEY}"
         if [ "$SSH_KEY_USED" = "yes" ]; then
-            echo "users:"
-            echo "  - default"
-            echo "  - name: ${USER_NAME}"
-            echo "    ssh_authorized_keys:"
             echo "      - ${SSH_PUBKEY}"
-            echo "    sudo: ALL=(ALL) NOPASSWD:ALL"
-            echo "    shell: /bin/bash"
         fi
+        echo "  - name: ${USER_NAME}"
+        echo "    ssh_authorized_keys:"
+        echo "      - ${DASHBOARD_PUBKEY}"
+        if [ "$SSH_KEY_USED" = "yes" ]; then
+            echo "      - ${SSH_PUBKEY}"
+        fi
+        echo "    sudo: ALL=(ALL) NOPASSWD:ALL"
+        echo "    shell: /bin/bash"
+        echo "runcmd:"
+        echo "  - sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config"
+        echo "  - systemctl restart ssh || systemctl restart sshd || service ssh restart"
     } > "$USER_DATA"
     unset USER_PASS USER_PASS_CONFIRM SSH_PUBKEY
 
@@ -506,10 +555,20 @@ boot_qemu() {
         -m "$RAM_VALUE" \
         -smp "${CPU_CORES:-2}" \
         -drive file="$SEED_IMG",format=raw,if=virtio \
-        -nographic \
+        -display none \
+        -daemonize \
         -netdev user,id=net0,hostfwd=tcp::${TCP_HOST_PORT}-:${TCP_GUEST_PORT},dns=8.8.8.8 \
         -device virtio-net-pci,netdev=net0 \
         -pidfile "$PID_FILE"
+
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}QEMU failed to start.${NC}"
+        pause_menu 3
+        return
+    fi
+
+    drop_into_shell "$TCP_HOST_PORT" "root"
+    show_menu
 }
 
 # ----------------------------------------------------------
@@ -532,6 +591,30 @@ restart_vps() {
     fi
 }
 
+stop_vps() {
+    if ! vm_is_running; then
+        echo -e "${YELLOW}No VM is currently running.${NC}"
+        pause_menu 2
+        return
+    fi
+    local pid
+    pid=$(cat "$PID_FILE")
+    echo -e "${YELLOW}Stopping VM (pid ${pid})...${NC}"
+    kill "$pid" 2>/dev/null
+    for _ in $(seq 1 15); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        echo -e "${RED}VM did not stop gracefully, forcing...${NC}"
+        kill -9 "$pid" 2>/dev/null
+    fi
+    rm -f "$PID_FILE"
+    pkill -f sshx >/dev/null 2>&1
+    echo -e "${GREEN}VM stopped.${NC}"
+    pause_menu 2
+}
+
 clean_vps() {
     if vm_is_running; then
         echo -e "${RED}VM is currently running (pid $(cat "$PID_FILE")). Stop it before cleaning up.${NC}"
@@ -542,6 +625,7 @@ clean_vps() {
     echo -e "${RED}Removing VPS files and configuration...${NC}"
     $SUDO_CMD rm -f "$USER_DATA" "$SEED_IMG" "$ENV_FILE" "$PID_FILE"
     $SUDO_CMD rm -f "${BASE_DIR}"/.disk_resized*
+    $SUDO_CMD rm -f "${DASHBOARD_KEY}" "${DASHBOARD_KEY}.pub"
     $SUDO_CMD rm -f "${IMG_PATH:-}"
     $SUDO_CMD rm -f "${BASE_DIR}"/ubuntu.qcow2 "${BASE_DIR}"/debian.qcow2
     pkill -f sshx >/dev/null 2>&1
