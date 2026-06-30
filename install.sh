@@ -332,6 +332,7 @@ create_vps() {
     fi
 
     $SUDO_CMD mkdir -p "$BASE_DIR"
+    $SUDO_CMD chown "$(id -u)":"$(id -g)" "$BASE_DIR"
 
     if [ ! -f "$IMG_PATH" ]; then
         echo -e "${YELLOW}Downloading ${OS_NAME} cloud image to ${BASE_DIR}...${NC}"
