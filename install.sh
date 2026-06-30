@@ -328,6 +328,14 @@ create_vps() {
 
         $SUDO_CMD chown "$(id -u)":"$(id -g)" "$IMG_PATH" 2>/dev/null
         $SUDO_CMD chmod 600 "$IMG_PATH"
+
+        echo -e "${YELLOW}Validating disk image integrity...${NC}"
+        if ! qemu-img check "$IMG_PATH" >/dev/null 2>&1; then
+            echo -e "${RED}Downloaded image failed integrity check - it may be truncated or corrupted.${NC}"
+            rm -f "$IMG_PATH"
+            pause_menu 3
+            return
+        fi
     else
         echo -e "${GREEN}Existing cached ${OS_NAME} image found at ${IMG_PATH}.${NC}"
     fi
@@ -366,6 +374,11 @@ create_vps() {
         $SUDO_CMD qemu-img resize "$IMG_PATH" "+${DISK_ADD}G"
         if [ $? -ne 0 ]; then
             echo -e "${RED}Disk resize failed.${NC}"
+            pause_menu 3
+            return
+        fi
+        if ! qemu-img check "$IMG_PATH" >/dev/null 2>&1; then
+            echo -e "${RED}Image failed integrity check after resize.${NC}"
             pause_menu 3
             return
         fi
@@ -487,10 +500,12 @@ boot_qemu() {
     qemu-system-x86_64 \
         $KVM_FLAGS \
         -cpu "$CPU_TYPE" \
-        -hda "$IMG_PATH" \
+        -machine type=pc,accel=kvm:tcg \
+        -boot order=c,menu=off \
+        -drive file="$IMG_PATH",format=qcow2,if=virtio,cache=writeback \
         -m "$RAM_VALUE" \
         -smp "${CPU_CORES:-2}" \
-        -drive file="$SEED_IMG",format=raw \
+        -drive file="$SEED_IMG",format=raw,if=virtio \
         -nographic \
         -netdev user,id=net0,hostfwd=tcp::${TCP_HOST_PORT}-:${TCP_GUEST_PORT},dns=8.8.8.8 \
         -device virtio-net-pci,netdev=net0 \
